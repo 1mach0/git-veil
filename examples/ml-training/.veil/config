@@ -1,19 +1,13 @@
-# Example: train on a shared GPU box, ship a checkpoint together with the code
-# that produced it. Copy this .veil/ folder to your repo root and edit.
-
-RELAY_HOST=gpu-box                 # Host alias in ~/.ssh/config
-RELAY_REPO=projects/myproj         # repo on the relay, relative to ~
+# Example: a training repo whose relay is a GPU server.
+RELAY_HOST=gpu-box
+RELAY_REPO=projects/model
 RELAY_BRANCH=main
-RELAY_PUSH_REMOTE=origin           # remote on the relay that points upstream
+RELAY_PUSH_REMOTE=origin
+NAMESPACE=sync
 
-SOURCE_REMOTE=origin               # your private repo
-SOURCE_BRANCH=main
-
-NAMESPACE=sync                     # bland names for refs/dirs left on the relay
-
-# A network change without a new checkpoint is a broken release.
-REQUIRE_TOGETHER=("src/myproj/model.py configs/model.yaml -> release/model.pt")
+# The network definition and the shipped checkpoint must always match.
+REQUIRE_TOGETHER=("src/model -> release/model.pt")
+# A new checkpoint should come with its own config.
 WARN_TOGETHER=("release/model.pt -> release/config.yaml")
-
-# Only run the (slow) verify hook when the release or the model changes.
-VERIFY_PATHS=(release src/myproj/model.py configs/model.yaml)
+# Only run the (slow) evaluation when something it depends on changed.
+VERIFY_PATHS=(release src/model)

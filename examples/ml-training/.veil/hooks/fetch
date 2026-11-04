@@ -1,9 +1,5 @@
-# Usage: git veil fetch NAME [CHECKPOINT]
-# Prints "remote<TAB>local" lines. Default: newest run, highest-numbered checkpoint.
-set -euo pipefail
-ckpt=${1:-}
-if [ -z "$ckpt" ]; then
-  run=$(ls -td runs/*/ | head -n1)
-  ckpt=$(ls "$run"ckpt_*.pt | sort -V | tail -n1)
-fi
-printf '%s\t%s\n' "$ckpt" release/model.pt "$(dirname "$ckpt")/config.yaml" release/config.yaml
+# `git veil fetch NAME [checkpoint]`: print "remote<TAB>local" pairs.
+ckpt=${1:-$(ls -t logs/"$VEIL_NAME"/ckpt_*.pt | head -n1)}
+dir=$(dirname "$ckpt")
+printf '%s\trelease/model.pt\n'   "$ckpt"
+printf '%s\trelease/config.yaml\n' "$dir/config.yaml"

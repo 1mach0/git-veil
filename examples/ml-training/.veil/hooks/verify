@@ -1,10 +1,4 @@
-# Runs during `git veil export` in a clean checkout of the candidate commit.
-# Non-zero exit = the export is cancelled and the relay is left untouched.
-set -euo pipefail
-python - <<'PY'
-import os, sys, myproj
-here = os.path.realpath(os.environ["VEIL_WORKTREE"])
-where = os.path.realpath(myproj.__file__)
-sys.exit(0 if where.startswith(here + os.sep) else f"myproj imported from {where}, not the worktree")
-PY
-python scripts/evaluate.py release/model.pt --out "$VEIL_KEEP_DIR"
+# Runs in a clean checkout of the commit about to be exported. Exit != 0 blocks it.
+set -e
+python scripts/evaluate.py --checkpoint release/model.pt --out eval_out
+cp -r eval_out "$VEIL_KEEP_DIR/"

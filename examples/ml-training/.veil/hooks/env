@@ -1,6 +1,12 @@
-# Sourced on the relay before every other hook (cwd = the worktree).
-# Non-interactive SSH doesn't read ~/.bashrc, so activate the env explicitly.
+# Sourced before every other hook, on the relay, cwd = $VEIL_WORKTREE.
+# Non-interactive ssh doesn't load your shell rc, so activate the env explicitly.
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate myproj
-# Many worktrees share one editable install: make imports resolve to THIS checkout.
+conda activate train
+# The package is pip-installed in editable mode from the main checkout; make
+# THIS worktree's copy win, and refuse to continue if it doesn't.
 export PYTHONPATH="$VEIL_WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
+python - "$VEIL_WORKTREE" <<'PY' || exit 1
+import os, sys, mypkg
+p = os.path.realpath(mypkg.__file__)
+sys.exit(0 if p.startswith(os.path.realpath(sys.argv[1]) + os.sep) else f"mypkg imported from {p}")
+PY
