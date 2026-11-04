@@ -104,8 +104,8 @@ next_tag() {
     | sed -n "s|^$TAG_PREFIX/\([0-9]\{4\}\)-.*|\1|p" | sort -n | tail -n1)
   printf '%s/%04d-%s' "$TAG_PREFIX" $((10#${n:--1} + 1)) "$(date -u +%Y%m%dT%H%M%SZ)"
 }
-tag_relay_commit() {
-  git for-each-ref --format='%(contents)' "refs/tags/$1" | sed -n 's/^relay-commit: //p' | head -n1
+tag_field() { # tag field -> value of "field: value" in the tag message
+  git for-each-ref --format='%(contents)' "refs/tags/$1" | sed -n "s/^$2: //p" | head -n1
 }
 
 # Snapshot of $1 with EXCLUDE paths replaced by the relay's ($2) versions. Prints a tree id.
@@ -123,13 +123,20 @@ build_tree() {
   rm -f "$idx"
 }
 
-# Paths the relay changed since the last export that the snapshot ($3) doesn't have.
+# Paths the relay changed since the last export that the source side has not taken in.
+# A relay change to path P counts as taken in if the snapshot ($3) has the relay's version
+# of P, or any source commit since the last export ($4..$5) ever had it (merged, then edited).
 pending_paths() {
-  local last=$1 tip=$2 tree=$3 p a b
+  local last=$1 tip=$2 tree=$3 slast=$4 src=$5 p a b c seen
   git diff --name-only -z --no-renames "$last" "$tip" | while IFS= read -r -d '' p; do
     a=$(git rev-parse -q --verify "$tip:$p" 2>/dev/null || true)
     b=$(git rev-parse -q --verify "$tree:$p" 2>/dev/null || true)
-    [[ $a == "$b" ]] || printf '%s\0' "$p"
+    [[ $a == "$b" ]] && continue
+    seen=0
+    while read -r c; do
+      [[ $(git rev-parse -q --verify "$c:$p" 2>/dev/null || true) == "$a" ]] && { seen=1; break; }
+    done < <(git --literal-pathspecs rev-list "$slast..$src" -- "$p")
+    ((seen)) || printf '%s\0' "$p"
   done
 }
 
@@ -193,14 +200,15 @@ wants_verify() { # base new
   changed_in "$1" "$2" "${VERIFY_PATHS[@]}"
 }
 
-# Sets: src tip last tag tree
+# Sets: src tip last slast tag tree
 resolve_state() {
   local ref=$1
   src=$(git rev-parse --verify -q "$ref^{commit}") || die "unknown ref $ref"
   tip=$(git rev-parse --verify -q "$RELAY_TRACK") || die "can't resolve relay branch $RELAY_BRANCH"
   tag=$(last_tag); [[ -n $tag ]] || die "no $TAG_PREFIX/* tag yet: run 'git veil init' first"
-  last=$(tag_relay_commit "$tag")
+  last=$(tag_field "$tag" relay-commit); slast=$(tag_field "$tag" source-commit)
   [[ -n $last ]] && git cat-file -e "$last^{commit}" 2>/dev/null || die "tag $tag doesn't name a relay commit I have"
+  git cat-file -e "$slast^{commit}" 2>/dev/null || die "tag $tag doesn't name a source commit I have"
   git merge-base --is-ancestor "$last" "$tip" \
     || die "relay $RELAY_BRANCH no longer contains the last export $(short "$last") (history rewritten on the relay?)"
   tree=$(build_tree "$src" "$tip")
@@ -346,11 +354,11 @@ source-commit: $src"
 
 cmd_status() {
   fetch_all
-  local src tip last tag tree
+  local src tip last slast tag tree
   resolve_state "$SOURCE_REF"
   say "source $SOURCE_REF = $(short "$src")"
   say "relay  $RELAY_BRANCH = $(short "$tip")   last export: $tag -> $(short "$last")"
-  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree" "$slast" "$src")
   if ((${#pend[@]})); then warn "relay has changes you don't (run 'git veil pull'):"; printf '  %s\n' "${pend[@]}" >&2; fi
   if [[ $tree == $(git rev-parse "$tip^{tree}") ]]; then say "relay is up to date"
   else say "export would send:"; git diff --stat "$tip" "$tree" >&2; fi
@@ -364,12 +372,12 @@ cmd_export() {
     --no-push) push=0; shift;; --allow-unpaired) unpaired=1; shift;;
     --ref) ref=$2; shift 2;; *) die "unknown option $1";; esac; done
   fetch_all
-  local src tip last tag tree
+  local src tip last slast tag tree
   resolve_state "$ref"
   [[ $ref == "$SOURCE_REF" ]] || warn "exporting $ref, not $SOURCE_REF"
   if [[ $tree == $(git rev-parse "$tip^{tree}") ]]; then say "nothing to export: relay matches $(short "$src")"; return 0; fi
 
-  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree" "$slast" "$src")
   if ((${#pend[@]})); then
     printf '  %s\n' "${pend[@]}" >&2
     die "the relay has changes (above) that $ref lacks; exporting would erase them. Run 'git veil pull', merge it, then export."
@@ -408,9 +416,9 @@ source-commit: $src"
 
 cmd_pull() {
   fetch_all
-  local src tip last tag tree
+  local src tip last slast tag tree
   resolve_state "$SOURCE_REF"
-  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree" "$slast" "$src")
   ((${#pend[@]})) || { say "nothing to pull: you already have every relay-side change"; return 0; }
   local br wt
   br="$NAMESPACE/pull-$(date -u +%Y%m%dT%H%M%SZ)"

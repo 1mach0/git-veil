@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015,SC2016,SC2012  # test idioms
 # End-to-end tests for git-veil against local mock repos.
 # The "relay" is a directory with its own HOME and git identity; ssh is faked
 # by a script that runs the command there. No network, no real ssh.
@@ -123,6 +124,10 @@ v pull >/dev/null; git fetch -q origin
 git merge -q --no-ff "$(git for-each-ref --format='%(refname:short)' 'refs/remotes/origin/sync/pull-*' | tail -1)" -m "merge sync"; git push -q
 grep -q "upstream fix" bin/check.sh && pass "pull brought relay change home" || fail "pull brought relay change home"
 v export -y >/dev/null; grep -q "b = 1" "$R/src/app.py" && grep -q "upstream fix" "$R/bin/check.sh" && pass "both changes on relay" || fail "both changes on relay"
+
+echo "# a relay change pulled, then edited again, is not reported as pending"
+echo "# team tweak" >> bin/check.sh; git commit -qam "edit pulled file"; git push -q
+v export -y >/dev/null && grep -q "team tweak" "$R/bin/check.sh" && pass "merged-then-edited file exports" || fail "merged-then-edited file exports"
 
 echo "# dirty relay checkout is protected"
 echo "hand edit" >> "$R/src/app.py"; echo "c = 1" >> src/app.py; git commit -qam c; git push -q
