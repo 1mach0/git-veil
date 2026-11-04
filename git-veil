@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2015  # remote scripts are single-quoted on purpose
+# git-veil — develop in your own repo, publish anonymised snapshots through a
+# relay host whose git identity you don't control.
+#
+#   source repo (yours)  --git veil export-->  relay repo  --git push-->  upstream
+#          ^                                        |
+#          +----------- git veil pull (branch) <----+   (changes made on the relay)
+#
+# Only file snapshots cross to the relay. Each relay commit is created ON THE
+# RELAY with `git commit-tree`, so it carries the relay's own user.name,
+# user.email and clock. Your authors, messages, branches and tags stay home.
+#
+# Usage: git veil <command> [options]
+#   init [-y]                 pair the source branch with the relay's current HEAD (once)
+#   status                    what export would send; relay changes you don't have yet
+#   export [options]          snapshot source branch -> one relay commit -> push upstream
+#       -m MSG                commit message on the relay (default "Update YYYY-MM-DD")
+#       -y                    don't ask for confirmation
+#       --verify|--no-verify  force/skip the verify hook (default: per VERIFY_PATHS)
+#       --no-push             commit on the relay, don't push upstream
+#       --allow-unpaired      downgrade REQUIRE_TOGETHER violations to warnings
+#       --ref REF             export REF instead of SOURCE_REMOTE/SOURCE_BRANCH
+#   pull                      put relay-side changes on a new branch in the source repo
+#   stage NAME [options]      snapshot a ref into its own worktree on the relay
+#       --ref REF             what to stage (default HEAD)
+#       --run                 run the 'run' hook in that worktree
+#       --env 'K=V ...'       extra environment for the hook
+#       -- ARGS               arguments for the hook
+#   fetch NAME [ARGS] [--force]  copy files the 'fetch' hook names from a staged
+#                             worktree into the current checkout (provenance-checked)
+#   runs                      list staged worktrees on the relay
+#   drop NAME                 remove a staged worktree (and everything in it)
+#
+# Config: .veil/config (bash). Hooks: .veil/hooks/{env,verify,run,fetch}.
+# See README.md.
+set -euo pipefail
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  echo "git-veil needs bash >= 4.4 (macOS ships 3.2: brew install bash)" >&2; exit 1
+fi
+VEIL_VERSION=0.1.0
+
+PROG="git veil"
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+say()  { printf '[veil] %s\n' "$*" >&2; }
+warn() { printf '[veil] WARNING: %s\n' "$*" >&2; }
+short(){ git rev-parse --short "$1"; }
+b64()  { printf '%s' "$1" | base64 | tr -d '\n'; }
+usage(){ sed -n '3,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+case ${1:-} in -h|--help|help|'') usage; exit 0;; --version|version) echo "git-veil $VEIL_VERSION"; exit 0;; esac
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+cd "$ROOT"
+
+# ---------------------------------------------------------------- config ----
+VEIL_CONFIG=${VEIL_CONFIG:-.veil/config}
+[[ -f $VEIL_CONFIG ]] || die "no config at $VEIL_CONFIG (see README: Quick start)"
+VEIL_DIR=$(dirname "$VEIL_CONFIG")
+
+RELAY_HOST=             # ssh destination / alias
+RELAY_REPO=             # repo path on the relay (relative to ~ or absolute)
+RELAY_BRANCH=main       # branch checked out in the relay repo
+RELAY_PUSH_REMOTE=origin # remote ON THE RELAY to push to; empty = never push
+RELAY_REMOTE=relay      # name of the relay remote in the source repo
+SOURCE_REMOTE=origin    # where the reviewed source branch lives
+SOURCE_BRANCH=main
+EXCLUDE=("$VEIL_DIR" .github)  # never exported; relay's own copy is kept
+DENYLIST=$VEIL_DIR/denylist
+REQUIRE_TOGETHER=()     # "a b -> c": if a or b changes, c must change (blocks)
+WARN_TOGETHER=()        # same syntax, warns only
+VERIFY_PATHS=()         # run verify hook only when these change; empty = always
+NAMESPACE=veil          # refs/<ns>/* and ~/.<ns>/ on the relay
+RUNS_DIR=               # staged worktrees on the relay (default ~/<ns>-runs)
+TAG_PREFIX=             # tags in the source repo: <prefix>/NNNN-<utc> (default: NAMESPACE)
+MAX_FILE_MB=95
+# shellcheck disable=SC1090
+source "$VEIL_CONFIG"
+[[ -n $RELAY_HOST && -n $RELAY_REPO ]] || die "set RELAY_HOST and RELAY_REPO in $VEIL_CONFIG"
+[[ $NAMESPACE =~ ^[A-Za-z0-9._-]+$ ]] || die "NAMESPACE must be a simple name"
+RUNS_DIR=${RUNS_DIR:-$NAMESPACE-runs}
+TAG_PREFIX=${TAG_PREFIX:-$NAMESPACE}
+SSH_CMD=${VEIL_SSH:-ssh}
+SOURCE_REF="$SOURCE_REMOTE/$SOURCE_BRANCH"
+RELAY_TRACK="refs/remotes/$RELAY_REMOTE/$RELAY_BRANCH"
+INCOMING="refs/$NAMESPACE/incoming"
+HOOKS=$VEIL_DIR/hooks
+
+hook_b64() { [[ -f $HOOKS/$1 ]] && base64 < "$HOOKS/$1" | tr -d '\n' || true; }
+
+# Run a bash script (string) on the relay with positional args.
+remote() {
+  local script=$1; shift
+  local q; q=$(printf '%q ' "$@")
+  printf '%s\n' "$REMOTE_LIB" "$script" | $SSH_CMD "$RELAY_HOST" "bash -s -- $q"
+}
+
+fetch_relay()  { git fetch -q "$RELAY_REMOTE" "+refs/heads/$RELAY_BRANCH:$RELAY_TRACK"; }
+fetch_all()    { git fetch -q --tags "$SOURCE_REMOTE"; fetch_relay; }
+
+last_tag() { git for-each-ref --sort=-refname --count=1 --format='%(refname:short)' "refs/tags/$TAG_PREFIX"; }
+next_tag() {
+  local n; n=$(git for-each-ref --format='%(refname:short)' "refs/tags/$TAG_PREFIX" \
+    | sed -n "s|^$TAG_PREFIX/\([0-9]\{4\}\)-.*|\1|p" | sort -n | tail -n1)
+  printf '%s/%04d-%s' "$TAG_PREFIX" $((10#${n:--1} + 1)) "$(date -u +%Y%m%dT%H%M%SZ)"
+}
+tag_relay_commit() {
+  git for-each-ref --format='%(contents)' "refs/tags/$1" | sed -n 's/^relay-commit: //p' | head -n1
+}
+
+# Snapshot of $1 with EXCLUDE paths replaced by the relay's ($2) versions. Prints a tree id.
+build_tree() {
+  local src=$1 tip=$2 idx p
+  idx=$(mktemp "${TMPDIR:-/tmp}/veil-idx.XXXXXX"); rm -f "$idx"
+  GIT_INDEX_FILE=$idx git read-tree "$src"
+  for p in "${EXCLUDE[@]}"; do
+    GIT_INDEX_FILE=$idx git --literal-pathspecs ls-files -z -- "$p" \
+      | GIT_INDEX_FILE=$idx git update-index -z --force-remove --stdin
+    git --literal-pathspecs ls-tree -r -z --full-tree "$tip" -- "$p" \
+      | GIT_INDEX_FILE=$idx git update-index -z --index-info
+  done
+  GIT_INDEX_FILE=$idx git write-tree
+  rm -f "$idx"
+}
+
+# Paths the relay changed since the last export that the snapshot ($3) doesn't have.
+pending_paths() {
+  local last=$1 tip=$2 tree=$3 p a b
+  git diff --name-only -z --no-renames "$last" "$tip" | while IFS= read -r -d '' p; do
+    a=$(git rev-parse -q --verify "$tip:$p" 2>/dev/null || true)
+    b=$(git rev-parse -q --verify "$tree:$p" 2>/dev/null || true)
+    [[ $a == "$b" ]] || printf '%s\0' "$p"
+  done
+}
+
+changed_in() { ! git --literal-pathspecs diff --quiet "$1" "$2" -- "${@:3}"; }
+
+# Block on denylisted terms in changed files, file names or extra strings; warn on home paths.
+leak_scan() {
+  local base=$1 new=$2; shift 2
+  local pats rc=0 hits p sz
+  pats=$(mktemp)
+  [[ -f $DENYLIST ]] && sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$DENYLIST" > "$pats"
+  [[ -s $pats ]] || warn "denylist ($DENYLIST) is empty: only built-in checks run"
+  local -a changed=()
+  mapfile -d '' changed < <(git diff --name-only -z --no-renames --diff-filter=AMT "$base" "$new")
+  if [[ -s $pats ]]; then
+    if ((${#changed[@]})); then
+      hits=$(git --literal-pathspecs grep -a -n -i -F -f "$pats" "$new" -- "${changed[@]}" 2>/dev/null | cut -c1-200 || true)
+      [[ -z $hits ]] || { warn "denylisted terms in files:"; printf '%s\n' "$hits" | sed "s/^$new:/  /" | head -n 40 >&2; rc=1; }
+      hits=$(printf '%s\n' "${changed[@]}" | grep -i -F -f "$pats" || true)
+      [[ -z $hits ]] || { warn "denylisted terms in file names:"; printf '  %s\n' "$hits" >&2; rc=1; }
+    fi
+    if (($#)); then
+      hits=$(printf '%s\n' "$@" | grep -i -F -f "$pats" || true)
+      [[ -z $hits ]] || { warn "denylisted terms in message / names / args:"; printf '  %s\n' "$hits" >&2; rc=1; }
+    fi
+  fi
+  if ((${#changed[@]})); then
+    hits=$(git --literal-pathspecs grep -I -n -E '(/Users/|/home/|[A-Za-z]:\\Users\\)[A-Za-z0-9._-]+' "$new" -- "${changed[@]}" 2>/dev/null | cut -c1-200 || true)
+    [[ -z $hits ]] || { warn "home-directory paths (check they aren't yours):"; printf '%s\n' "$hits" | sed "s/^$new:/  /" | head -n 20 >&2; }
+    for p in "${changed[@]}"; do
+      sz=$(git cat-file -s "$new:$p")
+      if ((sz > MAX_FILE_MB * 1024 * 1024)); then warn "$p is $((sz / 1048576)) MB (> $MAX_FILE_MB MB)"; rc=1; fi
+    done
+  fi
+  rm -f "$pats"
+  return $rc
+}
+
+# Check "a b -> c d" rules between trees $1 and $2. $3 = block(1)/warn(0). Returns 1 on a blocking violation.
+check_together() {
+  local base=$1 new=$2 blocking=$3; shift 3
+  local rule lhs rhs f rc=0
+  local -a l r
+  for rule in "$@"; do
+    [[ $rule == *' -> '* ]] || die "bad rule '$rule' (expected 'paths -> paths')"
+    lhs=${rule%% -> *}; rhs=${rule#* -> }
+    read -ra l <<< "$lhs"; read -ra r <<< "$rhs"
+    changed_in "$base" "$new" "${l[@]}" || continue
+    for f in "${r[@]}"; do
+      changed_in "$base" "$new" "$f" && continue
+      if ((blocking)); then warn "'$lhs' changed but '$f' did not (REQUIRE_TOGETHER)"; rc=1
+      else warn "'$lhs' changed but '$f' did not"; fi
+    done
+  done
+  return $rc
+}
+
+wants_verify() { # base new
+  [[ -f $HOOKS/verify ]] || return 1
+  ((${#VERIFY_PATHS[@]} == 0)) && return 0
+  changed_in "$1" "$2" "${VERIFY_PATHS[@]}"
+}
+
+# Sets: src tip last tag tree
+resolve_state() {
+  local ref=$1
+  src=$(git rev-parse --verify -q "$ref^{commit}") || die "unknown ref $ref"
+  tip=$(git rev-parse --verify -q "$RELAY_TRACK") || die "can't resolve relay branch $RELAY_BRANCH"
+  tag=$(last_tag); [[ -n $tag ]] || die "no $TAG_PREFIX/* tag yet: run 'git veil init' first"
+  last=$(tag_relay_commit "$tag")
+  [[ -n $last ]] && git cat-file -e "$last^{commit}" 2>/dev/null || die "tag $tag doesn't name a relay commit I have"
+  git merge-base --is-ancestor "$last" "$tip" \
+    || die "relay $RELAY_BRANCH no longer contains the last export $(short "$last") (history rewritten on the relay?)"
+  tree=$(build_tree "$src" "$tip")
+}
+
+transport_commit() { # tree parent -> throwaway commit that only carries objects (deleted on the relay)
+  GIT_AUTHOR_NAME=$NAMESPACE GIT_AUTHOR_EMAIL=$NAMESPACE@localhost \
+  GIT_COMMITTER_NAME=$NAMESPACE GIT_COMMITTER_EMAIL=$NAMESPACE@localhost \
+  GIT_AUTHOR_DATE='946684800 +0000' GIT_COMMITTER_DATE='946684800 +0000' \
+    git commit-tree "$1" -p "$2" -m "$NAMESPACE"
+}
+
+# ------------------------------------------------------- remote scripts ----
+# Prepended to every remote script. Hooks arrive base64-encoded and run with
+# the env hook sourced first, cwd = the worktree.
+REMOTE_LIB='
+set -euo pipefail
+fail(){ echo "relay: $*" >&2; exit 3; }
+abspath(){ case "$1" in /*) printf "%s" "$1";; *) printf "%s/%s" "$HOME" "$1";; esac; }
+run_hook(){ # wt env_b64 hook_b64 args...
+  local wt=$1 env=$2 hook=$3; shift 3
+  local f; f=$(mktemp "${TMPDIR:-/tmp}/veil-hook.XXXXXX")
+  { printf "%s" "$env" | base64 -d; echo; printf "%s" "$hook" | base64 -d; } > "$f"
+  local rc=0; ( cd "$wt" && VEIL_WORKTREE=$wt bash "$f" "$@" ) || rc=$?
+  rm -f "$f"; return $rc
+}
+'
+
+# args: repo branch tip incoming msg_b64 push_remote verify env_b64 verify_b64 ns
+REMOTE_COMMIT='
+repo=$1 branch=$2 tip=$3 ref=$4 msg_b64=$5 pushr=$6 verify=$7 env=$8 vhook=$9 ns=${10}
+cd "$repo"
+trap "git update-ref -d \"$ref\" 2>/dev/null || true" EXIT
+cur=$(git symbolic-ref --quiet --short HEAD) || fail "repo is on a detached HEAD"
+[ "$cur" = "$branch" ] || fail "repo is on branch $cur, expected $branch"
+[ "$(git rev-parse HEAD)" = "$tip" ] || fail "$branch moved since your fetch (now $(git rev-parse --short HEAD)); re-run"
+git update-index -q --refresh || true
+if ! git diff-index --quiet HEAD --; then
+  git status --short --untracked-files=no >&2
+  fail "uncommitted edits to tracked files (above); commit or discard them on the relay first"
+fi
+msgf=$(mktemp); printf "%s" "$msg_b64" | base64 -d > "$msgf"
+new=$(git commit-tree "$(git rev-parse "$ref^{tree}")" -p HEAD -F "$msgf")   # relay identity + clock
+rm -f "$msgf"
+if [ "$verify" = 1 ]; then
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/veil-verify.XXXXXX")
+  git worktree add -q --detach "$wt" "$new"
+  keep="$HOME/.$ns/verify/$(git rev-parse --short "$new")"; mkdir -p "$keep"
+  echo "relay: verifying $(git rev-parse --short "$new") in a clean checkout" >&2
+  export VEIL_COMMIT=$new VEIL_KEEP_DIR=$keep
+  rc=0; run_hook "$wt" "$env" "$vhook" >&2 || rc=$?
+  git worktree remove --force "$wt"
+  rmdir "$keep" 2>/dev/null || echo "relay: verify output kept in $keep" >&2
+  [ "$rc" = 0 ] || fail "verify hook FAILED (exit $rc); relay branch untouched"
+fi
+git merge --ff-only -q "$new" || fail "fast-forward failed (untracked files in the way?); relay branch untouched"
+if [ -n "$pushr" ]; then
+  git push -q "$pushr" "$branch" || echo "relay: committed $(git rev-parse --short "$new") but PUSH FAILED; push from the relay" >&2
+fi
+echo "$new"
+'
+
+# args: repo incoming name runs ns run env_b64 run_b64 extra_env [args...]
+REMOTE_STAGE='
+repo=$1 ref=$2 name=$3 runs=$4 ns=$5 run=$6 env=$7 rhook=$8 extra=$9; shift 9
+cd "$repo"
+trap "git update-ref -d \"$ref\" 2>/dev/null || true" EXIT
+wt=$(abspath "$runs/$name")
+[ ! -e "$wt" ] || fail "$wt already exists; pick another NAME or git veil drop $name"
+new=$(git commit-tree "$(git rev-parse "$ref^{tree}")" -p HEAD -m "stage: $name")
+git update-ref "refs/$ns/runs/$name" "$new"
+mkdir -p "$(dirname "$wt")"
+git worktree add -q --detach "$wt" "$new"
+echo "relay: staged $(git rev-parse --short "$new") at $wt" >&2
+if [ "$run" = 1 ]; then
+  read -ra kv <<< "$extra"
+  ( [ ${#kv[@]} -eq 0 ] || export "${kv[@]}"
+    export VEIL_NAME="$name" VEIL_COMMIT="$new"
+    run_hook "$wt" "$env" "$rhook" "$@" ) >&2 || fail "run hook failed"
+fi
+echo "$new"
+'
+
+# args: runs name env_b64 fetch_b64 [args...] -> commit, dirty flag, then "remote<TAB>local" lines
+REMOTE_FETCHLIST='
+runs=$1 name=$2 env=$3 fhook=$4; shift 4
+wt=$(abspath "$runs/$name")
+[ -d "$wt" ] || fail "no staged worktree $wt"
+commit=$(git -C "$wt" rev-parse HEAD)
+dirty=0; git -C "$wt" diff-index --quiet HEAD -- || dirty=1
+echo "$commit"; echo "$dirty"
+export VEIL_NAME=$name VEIL_COMMIT=$commit; run_hook "$wt" "$env" "$fhook" "$@" | while IFS=$(printf "\t") read -r r l; do
+  [ -n "$r" ] || continue
+  case "$r" in /*) ;; *) r="$wt/$r";; esac
+  [ -f "$r" ] || fail "fetch hook named a missing file: $r"
+  printf "%s\t%s\n" "$r" "$l"
+done
+'
+
+# args: repo runs ns
+REMOTE_RUNS='
+repo=$1 runs=$2 ns=$3
+dir=$(abspath "$runs"); [ -d "$dir" ] || { echo "(no staged worktrees in $dir)"; exit 0; }
+for wt in "$dir"/*/; do
+  wt=${wt%/}; [ -e "$wt/.git" ] || continue
+  d=""; git -C "$wt" diff-index --quiet HEAD -- || d=" (edited)"
+  printf "%-24s %s  %s%s\n" "$(basename "$wt")" "$(git -C "$wt" log -1 --format="%h %cr" HEAD)" "$(du -sh "$wt" 2>/dev/null | cut -f1)" "$d"
+done
+'
+
+# args: repo runs ns name
+REMOTE_DROP='
+repo=$1 runs=$2 ns=$3 name=$4
+wt=$(abspath "$runs/$name"); [ -d "$wt" ] || fail "no staged worktree $wt"
+git -C "$repo" worktree remove --force "$wt"
+git -C "$repo" update-ref -d "refs/$ns/runs/$name" 2>/dev/null || true
+echo "relay: removed $wt" >&2
+'
+
+# ------------------------------------------------------------- commands ----
+cmd_init() {
+  local yes=0; [[ ${1:-} == -y ]] && yes=1
+  git remote get-url "$RELAY_REMOTE" >/dev/null 2>&1 \
+    || { git remote add "$RELAY_REMOTE" "$RELAY_HOST:$RELAY_REPO"; say "added remote $RELAY_REMOTE -> $RELAY_HOST:$RELAY_REPO"; }
+  fetch_all
+  [[ -z $(last_tag) ]] || die "already initialised (latest tag $(last_tag))"
+  local src tip tree
+  src=$(git rev-parse --verify "$SOURCE_REF^{commit}") || die "can't resolve $SOURCE_REF"
+  tip=$(git rev-parse --verify "$RELAY_TRACK")
+  tree=$(build_tree "$src" "$tip")
+  if [[ $tree != $(git rev-parse "$tip^{tree}") ]]; then
+    warn "$SOURCE_REF and relay $RELAY_BRANCH differ; the first export will send:"
+    git diff --stat "$tip" "$tree" >&2
+    if ((!yes)); then read -r -p "Record relay $(short "$tip") as the baseline anyway? [y/N] " a; [[ $a == [yY]* ]] || die "aborted"; fi
+  fi
+  local t; t="$TAG_PREFIX/0000-init-$(date -u +%Y%m%dT%H%M%SZ)"
+  git tag -a "$t" "$src" -m "git-veil baseline
+relay-commit: $tip
+source-commit: $src"
+  git push -q "$SOURCE_REMOTE" "refs/tags/$t"
+  say "baseline $t: source $(short "$src") <-> relay $(short "$tip")"
+}
+
+cmd_status() {
+  fetch_all
+  local src tip last tag tree
+  resolve_state "$SOURCE_REF"
+  say "source $SOURCE_REF = $(short "$src")"
+  say "relay  $RELAY_BRANCH = $(short "$tip")   last export: $tag -> $(short "$last")"
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  if ((${#pend[@]})); then warn "relay has changes you don't (run 'git veil pull'):"; printf '  %s\n' "${pend[@]}" >&2; fi
+  if [[ $tree == $(git rev-parse "$tip^{tree}") ]]; then say "relay is up to date"
+  else say "export would send:"; git diff --stat "$tip" "$tree" >&2; fi
+}
+
+cmd_export() {
+  local msg="" yes=0 verify=auto push=1 unpaired=0 ref=$SOURCE_REF
+  while (($#)); do case $1 in
+    -m) msg=$2; shift 2;; -y) yes=1; shift;;
+    --verify) verify=1; shift;; --no-verify) verify=0; shift;;
+    --no-push) push=0; shift;; --allow-unpaired) unpaired=1; shift;;
+    --ref) ref=$2; shift 2;; *) die "unknown option $1";; esac; done
+  fetch_all
+  local src tip last tag tree
+  resolve_state "$ref"
+  [[ $ref == "$SOURCE_REF" ]] || warn "exporting $ref, not $SOURCE_REF"
+  if [[ $tree == $(git rev-parse "$tip^{tree}") ]]; then say "nothing to export: relay matches $(short "$src")"; return 0; fi
+
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  if ((${#pend[@]})); then
+    printf '  %s\n' "${pend[@]}" >&2
+    die "the relay has changes (above) that $ref lacks; exporting would erase them. Run 'git veil pull', merge it, then export."
+  fi
+
+  msg=${msg:-"Update $(date -u +%Y-%m-%d)"}
+  leak_scan "$tip" "$tree" "$msg" || die "leak scan failed: fix the files, or edit $DENYLIST if it's a false positive"
+  if ! check_together "$tip" "$tree" 1 "${REQUIRE_TOGETHER[@]}"; then
+    ((unpaired)) || die "REQUIRE_TOGETHER rule violated (above); pass --allow-unpaired to override"
+  fi
+  check_together "$tip" "$tree" 0 "${WARN_TOGETHER[@]}" || true
+
+  if [[ $verify == auto ]]; then wants_verify "$tip" "$tree" && verify=1 || verify=0; fi
+  [[ $verify == 0 || -f $HOOKS/verify ]] || die "--verify given but $HOOKS/verify doesn't exist"
+  local pushr=$RELAY_PUSH_REMOTE; ((push)) || pushr=""
+
+  say "relay $RELAY_HOST:$RELAY_REPO ($RELAY_BRANCH @ $(short "$tip")) <- $(short "$src")"
+  git diff --stat "$tip" "$tree" >&2
+  say "message: $msg | verify: $verify | push: ${pushr:-no}"
+  if ((!yes)); then read -r -p "Proceed? [y/N] " a; [[ $a == [yY]* ]] || die "aborted"; fi
+
+  local new
+  git push -q "$RELAY_REMOTE" "+$(transport_commit "$tree" "$tip"):$INCOMING"
+  new=$(remote "$REMOTE_COMMIT" "$RELAY_REPO" "$RELAY_BRANCH" "$tip" "$INCOMING" "$(b64 "$msg")" \
+        "$pushr" "$verify" "$(hook_b64 env)" "$(hook_b64 verify)" "$NAMESPACE" | tail -n1) || die "relay step failed (see above)"
+  [[ $new =~ ^[0-9a-f]{40}$ ]] || die "relay didn't report a commit"
+  fetch_relay
+  [[ $(git rev-parse "$new^{tree}") == "$tree" ]] || die "relay commit $new has an unexpected tree!"
+  local t; t=$(next_tag)
+  git tag -a "$t" "$src" -m "git-veil export
+relay-commit: $new
+source-commit: $src"
+  git push -q "$SOURCE_REMOTE" "refs/tags/$t"
+  say "exported $(short "$src") as relay $(short "$new") by $(git log -1 --format='%an <%ae>' "$new"); tagged $t"
+}
+
+cmd_pull() {
+  fetch_all
+  local src tip last tag tree
+  resolve_state "$SOURCE_REF"
+  local -a pend=(); mapfile -d '' pend < <(pending_paths "$last" "$tip" "$tree")
+  ((${#pend[@]})) || { say "nothing to pull: you already have every relay-side change"; return 0; }
+  local br wt
+  br="$NAMESPACE/pull-$(date -u +%Y%m%dT%H%M%SZ)"
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/veil-pull.XXXXXX"); rmdir "$wt"
+  git worktree add -q -b "$br" "$wt" "$src"
+  if ! git --literal-pathspecs diff --binary --no-renames "$last" "$tip" -- "${pend[@]}" | git -C "$wt" apply --3way --index; then
+    die "conflicts applying relay changes. Resolve in $wt (branch $br), commit, push; then 'git worktree remove $wt'"
+  fi
+  git -C "$wt" commit -q -F - <<EOF
+Sync relay-side changes ($(short "$last")..$(short "$tip"))
+
+$(git log --format='- %s' "$last..$tip")
+EOF
+  git -C "$wt" push -q -u "$SOURCE_REMOTE" "$br"
+  git worktree remove "$wt"
+  say "pushed $br with: ${pend[*]}"
+  say "merge it into $SOURCE_BRANCH (e.g. open a pull request), then export again"
+}
+
+cmd_stage() {
+  local name=${1:-}; [[ -n $name && $name != -* ]] || die "usage: git veil stage NAME [--ref REF] [--run] [--env 'K=V ...'] [-- ARGS]"; shift
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "NAME may only use letters, digits, . _ -"
+  local ref=HEAD run=0 extra=""
+  while (($#)); do case $1 in
+    --ref) ref=$2; shift 2;; --run) run=1; shift;; --env) extra=$2; shift 2;;
+    --) shift; break;; *) die "unknown option $1";; esac; done
+  ((run == 0)) || [[ -f $HOOKS/run ]] || die "--run needs $HOOKS/run"
+  [[ $ref != HEAD ]] || git diff-index --quiet HEAD -- || warn "uncommitted changes are NOT staged; only the committed HEAD is"
+  fetch_relay
+  local src tip tree new
+  src=$(git rev-parse --verify "$ref^{commit}"); tip=$(git rev-parse --verify "$RELAY_TRACK")
+  tree=$(build_tree "$src" "$tip")
+  leak_scan "$tip" "$tree" "$name" "$extra" "$@" || die "leak scan failed"
+  git push -q "$RELAY_REMOTE" "+$(transport_commit "$tree" "$tip"):$INCOMING"
+  new=$(remote "$REMOTE_STAGE" "$RELAY_REPO" "$INCOMING" "$name" "$RUNS_DIR" "$NAMESPACE" "$run" \
+        "$(hook_b64 env)" "$(hook_b64 run)" "$extra" "$@" | tail -n1) || die "relay step failed"
+  say "staged $(short "$src") ($ref) as $name @ $(short "$new") in ~/$RUNS_DIR/$name"
+}
+
+cmd_fetch() {
+  local name="" force=0; local -a args=()
+  while (($#)); do case $1 in --force) force=1; shift;; *) if [[ -z $name ]]; then name=$1; else args+=("$1"); fi; shift;; esac; done
+  [[ -n $name ]] || die "usage: git veil fetch NAME [HOOK ARGS] [--force]"
+  [[ -f $HOOKS/fetch ]] || die "fetch needs $HOOKS/fetch (prints 'remote<TAB>local' lines)"
+  fetch_relay
+  local out commit dirty
+  out=$(remote "$REMOTE_FETCHLIST" "$RUNS_DIR" "$name" "$(hook_b64 env)" "$(hook_b64 fetch)" "${args[@]}") || die "relay step failed"
+  local -a lines=(); mapfile -t lines <<< "$out"
+  commit=${lines[0]}; dirty=${lines[1]}
+  local -a pairs=("${lines[@]:2}") locals=() excl=() pr
+  ((${#pairs[@]})) && [[ -n ${pairs[0]} ]] || die "fetch hook named no files"
+  for pr in "${pairs[@]}"; do locals+=("${pr#*$'\t'}"); excl+=(":(exclude)${pr#*$'\t'}"); done
+  git fetch -q "$RELAY_REMOTE" "+refs/$NAMESPACE/runs/$name:refs/$NAMESPACE-relay/runs/$name"
+  [[ $(git rev-parse "refs/$NAMESPACE-relay/runs/$name") == "$commit" ]] || warn "worktree HEAD != refs/$NAMESPACE/runs/$name"
+  ((dirty == 0)) || warn "tracked files in that worktree were edited after staging: provenance is uncertain"
+  git diff-index --quiet HEAD -- "${locals[@]}" 2>/dev/null || die "destination files have uncommitted changes: ${locals[*]}"
+  local mine; mine=$(build_tree HEAD "$RELAY_TRACK")
+  if ! git diff --quiet "$commit" "$mine" -- . "${excl[@]}"; then
+    warn "your checkout's files differ from what '$name' was staged with:"
+    git diff --stat "$commit" "$mine" -- . "${excl[@]}" >&2
+    ((force)) || die "the fetched outputs wouldn't match this commit. Check out the staged code, or pass --force."
+  fi
+  local r l
+  for pr in "${pairs[@]}"; do
+    r=${pr%%$'\t'*}; l=${pr#*$'\t'}
+    mkdir -p "$(dirname "$l")"
+    $SSH_CMD "$RELAY_HOST" "cat -- $(printf %q "$r")" > "$l"
+    say "$name:$r -> $l"
+  done
+  say "review, commit and open a PR"
+}
+
+cmd_runs() { remote "$REMOTE_RUNS" "$RELAY_REPO" "$RUNS_DIR" "$NAMESPACE"; }
+
+cmd_drop() {
+  local name=${1:-}; [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "usage: git veil drop NAME"
+  read -r -p "Delete ~/$RUNS_DIR/$name on the relay, including all its outputs? [y/N] " a
+  [[ $a == [yY]* ]] || die "aborted"
+  remote "$REMOTE_DROP" "$RELAY_REPO" "$RUNS_DIR" "$NAMESPACE" "$name"
+}
+
+case $1 in
+  init) shift; cmd_init "$@";;
+  status) shift; cmd_status "$@";;
+  export) shift; cmd_export "$@";;
+  pull) shift; cmd_pull "$@";;
+  stage) shift; cmd_stage "$@";;
+  fetch) shift; cmd_fetch "$@";;
+  runs) shift; cmd_runs "$@";;
+  drop) shift; cmd_drop "$@";;
+  *) die "unknown command '$1' (git veil --help)";;
+esac
