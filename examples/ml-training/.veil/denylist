@@ -1,0 +1,5 @@
+# One term per line, case-insensitive. Anything here blocks an export.
+# Real names, handles, emails, laptop usernames, org/college names and domains.
+jane-doe
+jdoe@
+example-university

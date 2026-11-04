@@ -1,0 +1,6 @@
+# Sourced on the relay before every other hook (cwd = the worktree).
+# Non-interactive SSH doesn't read ~/.bashrc, so activate the env explicitly.
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate myproj
+# Many worktrees share one editable install: make imports resolve to THIS checkout.
+export PYTHONPATH="$VEIL_WORKTREE${PYTHONPATH:+:$PYTHONPATH}"

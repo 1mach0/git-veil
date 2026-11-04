@@ -1,0 +1,5 @@
+# Started by: git veil stage NAME --run [--env 'K=V ...'] [-- ARGS]
+# Detach long jobs so the SSH session can return.
+mkdir -p logs
+nohup python scripts/train.py --run-name "$VEIL_NAME" "$@" > "logs/$VEIL_NAME.out" 2>&1 &
+echo "training $VEIL_NAME (pid $!), log: $VEIL_WORKTREE/logs/$VEIL_NAME.out"
